@@ -1,0 +1,143 @@
+# economic_bot.py
+# Prototype bot: fetch economic data, classify, generate automatic conclusions, send to Telegram
+
+import os, time, requests, feedparser
+from datetime import datetime, timezone
+from typing import Dict, List
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TE_CREDENTIAL = os.getenv("TE_CREDENTIAL", "guest:guest")
+MAX_PER_SOURCE = int(os.getenv("MAX_PER_SOURCE", "6"))
+
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    raise SystemExit("Please set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID as environment variables.")
+
+def safe_request_json(url):
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return None
+
+def safe_feed_parse(url):
+    try:
+        return feedparser.parse(requests.get(url, timeout=15).content)
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return None
+
+# --- Fetch sources ---
+def fetch_tradingeconomics(limit=MAX_PER_SOURCE) -> List[Dict]:
+    url = f"https://api.tradingeconomics.com/calendar?c={TE_CREDENTIAL}"
+    data = safe_request_json(url)
+    if not data: return []
+    return [{
+        "source": "TradingEconomics",
+        "title": d.get("Event"),
+        "country": d.get("Country"),
+        "date": d.get("Date"),
+        "actual": d.get("Actual"),
+        "forecast": d.get("Forecast"),
+        "previous": d.get("Previous"),
+        "importance": d.get("Importance")
+    } for d in data[:limit]]
+
+def fetch_investing(limit=MAX_PER_SOURCE):
+    f = safe_feed_parse("https://www.investing.com/rss/news.rss")
+    if not f: return []
+    return [{
+        "source": "Investing",
+        "title": e.title,
+        "summary": getattr(e, "summary", ""),
+        "link": e.link,
+        "published": e.published
+    } for e in f.entries[:limit]]
+
+def fetch_forexfactory(limit=MAX_PER_SOURCE):
+    f = safe_feed_parse("https://cdn-nfs.forexfactory.net/ffcal_week_this.xml")
+    if not f: return []
+    return [{
+        "source": "ForexFactory",
+        "title": e.title,
+        "summary": getattr(e, "summary", ""),
+        "published": e.published
+    } for e in f.entries[:limit]]
+
+def fetch_econoday(limit=MAX_PER_SOURCE):
+    f = safe_feed_parse("https://us.econoday.com/rss.aspx?type=event")
+    if not f: return []
+    return [{
+        "source": "Econoday",
+        "title": e.title,
+        "summary": getattr(e, "summary", ""),
+        "link": e.link,
+        "published": e.published
+    } for e in f.entries[:limit]]
+
+# --- Classification ---
+SHORT_TERM_KEYWORDS = ["CPI","Inflation","NFP","Unemployment","Retail","PMI","GDP","Rate","Decision","Jobs","Payroll","Fed","ECB","BOE","BOJ"]
+
+def classify_item(item: Dict) -> str:
+    text = f"{item.get('title','')} {item.get('summary','')}".lower()
+    if any(k.lower() in text for k in SHORT_TERM_KEYWORDS):
+        return "short"
+    return "long"
+
+# --- Conclusion Logic ---
+def generate_conclusion(item: Dict) -> str:
+    title = (item.get("title") or "").lower()
+    def to_float(x):
+        try: return float(str(x).replace("%","").strip())
+        except: return None
+    a, f = to_float(item.get("actual")), to_float(item.get("forecast"))
+    if "rate" in title and "decision" in title:
+        if a and f:
+            return "Bullish (Rate Hike)" if a>f else "Bearish (Rate Cut)" if a<f else "Neutral (Unchanged)"
+    if "cpi" in title or "inflation" in title:
+        if a and f:
+            return "Bullish (higher inflation)" if a>f else "Bearish (lower inflation)"
+    if "unemployment" in title:
+        if a and f:
+            return "Bullish (lower jobless)" if a<f else "Bearish (higher jobless)"
+    if "gdp" in title:
+        if a and f:
+            return "Bullish (growth ↑)" if a>f else "Bearish (growth ↓)"
+    if a and f:
+        return "Bullish" if a>f else "Bearish" if a<f else "Neutral"
+    return ""
+
+# --- Formatter ---
+def format_entries(entries: List[Dict]):
+    short, long = [], []
+    for it in entries:
+        cls = classify_item(it)
+        line = f"<b>{it.get('source')}</b> • {it.get('title')}"
+        if it.get("actual") or it.get("forecast"):
+            line += f" (Act:{it.get('actual')}, Fcst:{it.get('forecast')}, Prev:{it.get('previous')})"
+        conc = generate_conclusion(it)
+        if conc: line += f"\n👉 {conc}"
+        if it.get("link"): line += f"\n<a href='{it['link']}'>Link</a>"
+        if cls=="short": short.append(line)
+        else: long.append(line)
+    return short,long
+
+# --- Telegram ---
+def send_message(text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url,data={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"HTML"})
+
+def main():
+    all_items = fetch_tradingeconomics()+fetch_investing()+fetch_forexfactory()+fetch_econoday()
+    seen,set_items=set(),[]
+    for it in all_items:
+        if it["title"] not in seen: seen.add(it["title"]); set_items.append(it)
+    short,long=format_entries(set_items)
+    now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    msg=f"<b>📊 Economic Update</b>\n{now}\n\n<b>📢 Short Term</b>\n"+"\n\n".join(short)+"\n\n<b>🧭 Long Term</b>\n"+"\n\n".join(long)
+    send_message(msg[:3900])
+
+if __name__=="__main__":
+    main()
